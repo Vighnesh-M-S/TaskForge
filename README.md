@@ -46,7 +46,9 @@ agent/tools.py     The four tools.
 agent/nodes.py     The five async node functions and their prompts.
 agent/graph.py     LangGraph StateGraph wiring and the execute-loop router.
 demo/              Sample inputs and run_demo.sh.
-tests/             Tool unit tests and an end-to-end graph test with a scripted LLM.
+agent/runner.py    Runs the graph and yields progress; shared by the CLI and the web server.
+web/               FastAPI server and the single-page interface.
+tests/             Tool, graph and web tests with a scripted LLM.
 ```
 
 ### Tools
@@ -98,6 +100,28 @@ Run the tests (no API key or network needed):
 ```bash
 python -m pytest
 ```
+
+## Web interface
+
+```bash
+uvicorn web.app:app --reload
+```
+
+Open http://localhost:8000. Type a task or pick an example, and watch the stages stream in live, followed by the report and the files the run produced.
+
+Each web run works in its own temporary folder that holds fresh copies of `demo/amounts.csv` and `demo/invoice.txt`. The file tools cannot read or write outside that folder, and it is deleted when the run ends. One task runs at a time.
+
+### Hosting it
+
+The repo includes a `Dockerfile`, so any host that builds from one works (Render, Railway, Fly.io, Hugging Face Spaces). On Render, for example: New > Web Service > connect the GitHub repo > it detects the Dockerfile. Then set these environment variables in the host's dashboard (do not commit `.env`):
+
+| Variable | Value |
+|---|---|
+| `GROQ_API_KEY` (or `XAI_API_KEY` / `ANTHROPIC_API_KEY`) | your model key |
+| `TASKFORGE_PASSWORD` | a password you share with the people you show it to |
+| `TASKFORGE_MODEL` | optional model override |
+
+Set `TASKFORGE_PASSWORD` before sharing the link. The agent runs model-written Python on the server, so anyone who can submit tasks can make the server run code and spend your model quota. The password, the per-run folder, the unprivileged container user and the removal of API keys from the Python subprocess reduce that risk; they are not a full sandbox.
 
 ## Demo tasks
 

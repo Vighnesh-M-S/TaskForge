@@ -6,9 +6,11 @@ so the agent can observe it and adapt.
 """
 
 import html
+import os
 import re
 import subprocess
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +24,30 @@ MAX_SNIPPETS = 5
 _USER_AGENT = "Mozilla/5.0 (compatible; TaskForge/1.0)"
 _SNIPPET_RE = re.compile(r'class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
+
+
+# When set (by the web server), file tools are confined to this directory and run_python starts in it.
+# Unset (the CLI), paths are relative to the current directory as usual.
+WORKSPACE: ContextVar[Path | None] = ContextVar("taskforge_workspace", default=None)
+
+_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def _resolve(path: str) -> Path:
+    """Map a tool path to a real path, refusing anything outside the workspace when one is set."""
+    workspace = WORKSPACE.get()
+    if workspace is None:
+        return Path(path)
+    root = workspace.resolve()
+    target = (root / path).resolve()
+    if not target.is_relative_to(root):
+        raise PermissionError("path is outside the task workspace")
+    return target
+
+
+def _child_env() -> dict[str, str]:
+    """Environment for run_python: the parent's, minus anything that looks like a credential."""
+    return {k: v for k, v in os.environ.items() if not any(m in k.upper() for m in _SECRET_MARKERS)}
 
 
 def is_error(result: str) -> bool:
@@ -89,7 +115,7 @@ def web_search(query: str) -> str:
 def read_file(path: str) -> str:
     """Return the text contents of a file."""
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return _resolve(path).read_text(encoding="utf-8")
     except Exception as exc:
         return f"{ERROR_PREFIX} could not read {path}: {type(exc).__name__}: {exc}"
 
@@ -97,7 +123,7 @@ def read_file(path: str) -> str:
 def write_file(path: str, content: str) -> str:
     """Write text to a file, creating parent directories as needed."""
     try:
-        target = Path(path)
+        target = _resolve(path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"Written to {path} ({len(content)} chars)"
@@ -113,6 +139,8 @@ def run_python(code: str) -> str:
             capture_output=True,
             text=True,
             timeout=PYTHON_TIMEOUT_SECONDS,
+            cwd=WORKSPACE.get(),
+            env=_child_env(),
         )
     except subprocess.TimeoutExpired:
         return f"{ERROR_PREFIX} python timed out after {PYTHON_TIMEOUT_SECONDS}s"

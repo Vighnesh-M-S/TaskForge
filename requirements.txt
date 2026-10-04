@@ -3,4 +3,6 @@ langchain-openai
 langchain-anthropic
 httpx
 python-dotenv
+fastapi
+uvicorn
 pytest

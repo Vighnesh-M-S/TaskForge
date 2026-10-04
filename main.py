@@ -2,43 +2,19 @@
 
 import asyncio
 import sys
-from typing import Any
 
 from dotenv import load_dotenv
 
-from agent.graph import build_graph
 from agent.nodes import PROVIDERS, active_model, active_provider
+from agent.runner import describe, stream_task
 from agent.state import AgentState
-
-# Two passes (initial + one repair) of plan + up to 8 steps x 3 attempts + verify, with headroom.
-RECURSION_LIMIT = 100
-
-
-def _progress(node: str, update: dict[str, Any]) -> None:
-    """Print a one-line trace of what each node just did (to stderr, so stdout is only the final answer)."""
-    if node == "understand":
-        line = f"goal: {update['understanding'].get('goal', '')}"
-    elif node == "plan":
-        line = "\n".join(["plan:"] + [f"    {i + 1}. {s}" for i, s in enumerate(update["plan"])])
-    elif node == "execute":
-        step = update["steps_taken"][-1]
-        first_line = (step["result"].splitlines() or [""])[0][:160]
-        line = f"step {step['step']} attempt {step['attempt']}: {step['tool']} -> {'ok' if step['ok'] else 'FAILED'}: {first_line}"
-    elif node == "verify":
-        line = f"verified={update['verified']}" + ("" if update["verified"] else f" - {update['verify_reason'].splitlines()[0][:200]}")
-    else:
-        line = "assembling final output"
-    print(f"[{node}] {line}", file=sys.stderr, flush=True)
 
 
 async def run_task(task: str) -> AgentState:
-    """Run one task through the graph, printing progress, and return the final state."""
-    graph = build_graph()
+    """Run one task through the graph, printing progress to stderr, and return the final state."""
     state: AgentState = {"task": task}
-    async for chunk in graph.astream(state, {"recursion_limit": RECURSION_LIMIT}, stream_mode="updates"):
-        for node, update in chunk.items():
-            state.update(update)
-            _progress(node, update)
+    async for node, update, state in stream_task(task):
+        print(f"[{node}] {describe(node, update)}", file=sys.stderr, flush=True)
     return state
 
 
