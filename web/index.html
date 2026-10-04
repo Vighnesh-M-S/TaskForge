@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TaskForge</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --panel: #ffffff; --ink: #1c1b18; --muted: #6b6860; --line: #e2dfd6;
+    --accent: #b4491f; --accent-ink: #ffffff; --ok: #1f7a4d; --bad: #b3261e; --code: #f1efe8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151412; --panel: #1e1d1a; --ink: #ece9e1; --muted: #9a968b; --line: #33312c;
+      --accent: #e0733f; --accent-ink: #151412; --ok: #5cc48f; --bad: #f2877f; --code: #262420;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 40px 16px 64px; }
+  h1 { margin: 0; font-size: 30px; letter-spacing: -0.02em; }
+  .lede { margin: 6px 0 24px; color: var(--muted); }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 18px; }
+  label { display: block; font-size: 13px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+  textarea, input[type=password] {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font: inherit;
+  }
+  textarea { min-height: 92px; resize: vertical; }
+  textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 14px; }
+  .chip { border: 1px solid var(--line); background: transparent; color: var(--ink); border-radius: 999px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  .chip:hover { border-color: var(--accent); color: var(--accent); }
+  .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #run { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 8px; padding: 10px 22px; font: inherit; font-weight: 600; cursor: pointer; }
+  #run:disabled { opacity: 0.55; cursor: default; }
+  #model { color: var(--muted); font-size: 13px; }
+  #password-row { margin-top: 12px; display: none; }
+  h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 10px; }
+  #trace { list-style: none; margin: 0; padding: 0; }
+  #trace li { display: grid; grid-template-columns: 92px 1fr; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+  #trace li:first-child { border-top: 0; }
+  .stage { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--accent); padding-top: 2px; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+  .text.fail { color: var(--bad); }
+  #status { color: var(--muted); font-size: 14px; margin-top: 10px; }
+  .badge { display: inline-block; border-radius: 999px; padding: 3px 12px; font-size: 13px; font-weight: 700; margin-bottom: 12px; }
+  .badge.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .badge.bad { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+  pre { background: var(--code); border-radius: 8px; padding: 12px; margin: 0; overflow-x: auto; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .file { margin-top: 14px; }
+  .file-name { font: 600 13px ui-monospace, SFMono-Regular, Menlo, monospace; margin-bottom: 6px; }
+  .hidden { display: none; }
+  footer { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>TaskForge</h1>
+  <p class="lede">Describe a task. The agent plans the steps, runs real tools, checks its own result, and shows the evidence.</p>
+
+  <section class="panel">
+    <label for="task">Task</label>
+    <textarea id="task" maxlength="1000" placeholder="e.g. Read demo/amounts.csv, convert each USD amount to INR at today's rate, and write the results to demo/output.csv"></textarea>
+    <div class="examples" id="examples"></div>
+    <div class="row">
+      <button id="run">Run task</button>
+      <span id="model"></span>
+    </div>
+    <div id="password-row">
+      <label for="password">Access password</label>
+      <input id="password" type="password" autocomplete="current-password">
+    </div>
+  </section>
+
+  <section class="panel hidden" id="trace-panel">
+    <h2>Live trace</h2>
+    <ol id="trace"></ol>
+    <div id="status"></div>
+  </section>
+
+  <section class="panel hidden" id="result-panel">
+    <h2>Result</h2>
+    <div id="badge"></div>
+    <pre id="report"></pre>
+    <div id="files"></div>
+  </section>
+
+  <footer>Two sample files are available to every task: <code>demo/amounts.csv</code> (5 names with USD amounts) and <code>demo/invoice.txt</code> (an invoice totalling ₹67,500). Each run gets a fresh copy; files it writes are shown above and then discarded.</footer>
+</main>
+
+<script>
+const EXAMPLES = [
+  ["Convert a CSV to INR", "Read demo/amounts.csv, find today's USD to INR exchange rate, convert each USD amount to INR, and write the results to demo/output.csv with columns Name, USD_Amount, INR_Amount."],
+  ["Bangalore weather", "Find the current weather in Bangalore and write a one-line summary to demo/weather.txt"],
+  ["Approve or reject an invoice", "Read demo/invoice.txt, extract the total amount, check if it exceeds ₹50,000, and write demo/approved.txt if it does not exceed it or demo/rejected.txt if it does, with the reason."],
+];
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text !== undefined) n.textContent = text; return n; };
+
+for (const [label, task] of EXAMPLES) {
+  const chip = el("button", "chip", label);
+  chip.type = "button";
+  chip.onclick = () => { $("task").value = task; };
+  $("examples").append(chip);
+}
+
+fetch("/api/info").then((r) => r.json()).then((info) => {
+  $("model").textContent = info.provider ? `Model: ${info.model}` : "No model API key configured on the server";
+  if (info.password_required) {
+    $("password-row").style.display = "block";
+    try { $("password").value = sessionStorage.getItem("taskforge-password") || ""; } catch {}
+  }
+}).catch(() => {});
+
+function addTrace(node, text) {
+  const li = el("li");
+  li.append(el("span", "stage", node), el("span", "text" + (/FAILED|verified=False/.test(text) ? " fail" : ""), text));
+  $("trace").append(li);
+  li.scrollIntoView({ block: "nearest" });
+}
+
+function showResult(event) {
+  $("result-panel").classList.remove("hidden");
+  $("badge").replaceChildren(el("span", "badge " + (event.verified ? "ok" : "bad"), event.verified ? "Verified" : "Not verified"));
+  $("report").textContent = event.final_output;
+  $("files").replaceChildren();
+  for (const [name, content] of Object.entries(event.files || {})) {
+    const box = el("div", "file");
+    box.append(el("div", "file-name", name), el("pre", "", content));
+    $("files").append(box);
+  }
+}
+
+async function run() {
+  const task = $("task").value.trim();
+  if (!task) { $("task").focus(); return; }
+  const password = $("password").value;
+  try { sessionStorage.setItem("taskforge-password", password); } catch {}
+
+  $("run").disabled = true;
+  $("trace").replaceChildren();
+  $("trace-panel").classList.remove("hidden");
+  $("result-panel").classList.add("hidden");
+  const started = Date.now();
+  const timer = setInterval(() => { $("status").textContent = `Working… ${Math.round((Date.now() - started) / 1000)}s (free-tier model limits can add pauses)`; }, 1000);
+  let finished = false;
+
+  try {
+    const response = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-TaskForge-Password": password },
+      body: JSON.stringify({ task }),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(typeof body.detail === "string" ? body.detail : `Request failed (${response.status})`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop();
+      for (const part of parts) {
+        if (!part.startsWith("data: ")) continue;
+        const event = JSON.parse(part.slice(6));
+        if (event.type === "progress") addTrace(event.node, event.text);
+        else if (event.type === "done") { finished = true; showResult(event); }
+        else if (event.type === "error") throw new Error(event.message);
+      }
+    }
+    if (!finished) throw new Error("The connection closed before the task finished.");
+    $("status").textContent = `Finished in ${Math.round((Date.now() - started) / 1000)}s.`;
+  } catch (error) {
+    $("status").textContent = "";
+    addTrace("error", "FAILED: " + error.message);
+  } finally {
+    clearInterval(timer);
+    if (!finished) $("status").textContent = "";
+    $("run").disabled = false;
+  }
+}
+$("run").onclick = run;
+</script>
+</body>
+</html>
