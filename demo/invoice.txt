@@ -1,0 +1,20 @@
+INVOICE
+
+Invoice No:   INV-2026-0417
+Date:         28 September 2026
+Billed To:    Northwind Traders Pvt Ltd, Bengaluru
+From:         Kaveri Design Studio
+
+Description                         Qty    Rate (₹)    Amount (₹)
+---------------------------------------------------------------
+Website redesign                      1      40,000        40,000
+Logo and brand kit                    1      12,500        12,500
+Hosting setup (annual)                1       4,700         4,700
+---------------------------------------------------------------
+Subtotal                                                   57,200
+GST (18%)                                                  10,296
+Rounding                                                        4
+---------------------------------------------------------------
+TOTAL                                                     ₹67,500
+
+Payment due within 15 days of the invoice date.
