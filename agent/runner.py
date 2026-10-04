@@ -10,6 +10,13 @@ from agent.state import AgentState
 RECURSION_LIMIT = 100
 
 
+def _brief(result: str, limit: int = 160) -> str:
+    """First line of a tool result, plus how much more there is, so a multi-line result does not look empty."""
+    lines = result.splitlines() or [""]
+    more = f" (+{len(lines) - 1} more lines)" if len(lines) > 1 else ""
+    return f"{lines[0][:limit]}{more}"
+
+
 def describe(node: str, update: dict[str, Any]) -> str:
     """One short human-readable description of what a node just did."""
     if node == "understand":
@@ -18,12 +25,14 @@ def describe(node: str, update: dict[str, Any]) -> str:
         return "\n".join(["plan:"] + [f"    {i + 1}. {s}" for i, s in enumerate(update["plan"])])
     if node == "execute":
         step = update["steps_taken"][-1]
-        first_line = (step["result"].splitlines() or [""])[0][:160]
-        return f"step {step['step']} attempt {step['attempt']}: {step['tool']} -> {'ok' if step['ok'] else 'FAILED'}: {first_line}"
+        head = f"step {step['step']} attempt {step['attempt']}: {step['tool']}"
+        status = step.get("status", "ok" if step["ok"] else "error")
+        if status == "unmet":
+            return f"{head} -> CRITERION NOT MET: {step.get('note', '')} | got: {_brief(step['result'])}"
+        return f"{head} -> {'ok' if status == 'ok' else 'FAILED'}: {_brief(step['result'])}"
     if node == "verify":
-        if update["verified"]:
-            return "verified=True"
-        return f"verified=False - {(update['verify_reason'].splitlines() or [''])[0][:200]}"
+        reason = " ".join(update.get("verify_reason", "").split())[:300]
+        return f"verified={update['verified']} - {reason}"
     return "assembling final output"
 
 

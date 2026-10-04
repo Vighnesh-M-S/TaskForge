@@ -17,11 +17,11 @@ TaskForge works out that this is a currency conversion on a file, plans the tool
 | Goal | `main.py` | The task arrives as plain text. |
 | Understand | `understand_node` | The LLM extracts the goal, inputs, expected output, the files involved, and checkable success criteria as JSON. |
 | Plan | `plan_node` | The LLM chooses an ordered sequence of tool calls. Each step says what to do and what success looks like. |
-| Execute | `execute_node` | One tool call per pass. The LLM picks the exact tool and arguments using everything observed so far. |
+| Execute | `execute_node` | One tool call per pass. The LLM picks the exact tool and arguments using everything observed so far. A `web_search` or `run_python` result is then checked against the step's own success criterion; one that runs but misses it is marked `UNMET` and retried. |
 | Observe | `execute_node` | The tool result (or error) is appended to the state and shown to the LLM on the next pass. |
 | Adapt | `execute_node`, `plan_node` + routers | A failed step is retried with a different approach, up to 3 attempts, then recorded as failed. A step that is no longer needed can be skipped. If verification fails, the run goes back to Plan once with the verifier's findings for a repair pass. |
 | Verify | `verify_node` | Output and input files are re-read from disk and checked against the success criteria from Understand. The LLM writes a check script that recomputes numbers and row counts, the script is run, and the verdict is based on its output. The execution log is not trusted. |
-| Complete | `complete_node` | Summary, steps taken, verdict, evidence preview and caveats (including every failed attempt). |
+| Complete | `complete_node` | Summary, steps taken, verdict, evidence preview and caveats (including every failed attempt). Every number in the LLM-written summary must appear in the tool results or the re-read files; otherwise the summary is re-asked once, then replaced by one built from state, and that is disclosed. |
 
 Nothing in the code is specific to a task. The same graph handles all three demo tasks; the tool sequence comes from the LLM.
 

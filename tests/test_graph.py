@@ -130,3 +130,59 @@ def test_extract_json_tolerates_fences_and_prose() -> None:
     assert nodes._extract_json(json.dumps([1, 2])) == [1, 2]
     with pytest.raises(ValueError):
         nodes._extract_json("no json here")
+
+
+# --- grounding of the narration, and enforcement of step success criteria -----
+
+EVIDENCE = "Name,USD_Amount,EUR_Amount\nMeera Nair,89.99,79.98\nDaniel Kim,3000,2666.36\nPriya Menon,725.25,644.59\nrate 0.888786"
+
+
+def test_ungrounded_numbers_flags_values_that_are_not_in_the_evidence() -> None:
+    summary = "Converted 3 rows at 0.888786: Meera Nair 80.02, Daniel Kim 2668.36, Priya Menon 645.21."
+    assert nodes.ungrounded_numbers(summary, EVIDENCE) == ["80.02", "2668.36", "645.21"]
+
+
+def test_ungrounded_numbers_accepts_exact_values_in_other_formats() -> None:
+    assert nodes.ungrounded_numbers("Total ₹67,500.00 exceeds ₹50,000; 3 rows, 2,666.36 EUR.", "TOTAL 67500, limit 50000\n2666.36") == []
+
+
+def scripted_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, summaries: list[str], checks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Run a one-step task whose run_python step prints 79.98 and writes out.txt; summaries/checks are consumed in order."""
+    out = tmp_path / "out.txt"
+    code = f"open({str(out)!r}, 'w').write('79.98'); print('79.98')"
+    scripted_llm(monkeypatch, [{"tool": "run_python", "args": {"code": code}}] * 3, verified=True)
+    base = nodes.ask_json
+    remaining_summaries, remaining_checks = list(summaries), list(checks or [])
+
+    async def ask(system: str, user: str) -> Any:
+        if system is nodes.PLAN_SYSTEM:
+            return {"steps": [{"tool": "run_python", "action": "compute", "success": "prints the amount"}]}
+        if system is nodes.STEP_CHECK_SYSTEM:
+            return remaining_checks.pop(0) if remaining_checks else {"met": True}
+        if system is nodes.COMPLETE_SYSTEM:
+            return {"summary": remaining_summaries.pop(0), "caveats": ["Rate was 0.5 yesterday."]}
+        return await base(system, user)
+
+    monkeypatch.setattr(nodes, "ask_json", ask)
+    return run("convert it")
+
+
+def test_summary_with_invented_numbers_is_reasked_then_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = scripted_run(monkeypatch, tmp_path, ["The amount is 80.02.", "The amount is 79.98."])
+    assert "Summary: The amount is 79.98." in state["final_output"]
+    assert "80.02" not in state["final_output"]
+    # The caveat quoting a number that is nowhere in the evidence is dropped as well.
+    assert "0.5" not in state["final_output"]
+
+
+def test_summary_that_stays_ungrounded_is_replaced_and_disclosed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = scripted_run(monkeypatch, tmp_path, ["The amount is 80.02.", "The amount is 80.02."])
+    assert "Summary: Ran 1 tool calls; the result passed verification." in state["final_output"]
+    assert "discarded because it stated numbers not found in the evidence (80.02)" in state["final_output"]
+
+
+def test_step_that_misses_its_success_criterion_is_retried_and_shown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    state = scripted_run(monkeypatch, tmp_path, ["Done."], checks=[{"met": False, "reason": "no amount in output"}, {"met": True}])
+    assert [(s["attempt"], s["status"]) for s in state["steps_taken"]] == [(1, "unmet"), (2, "ok")]
+    assert "1. UNMET run_python - no amount in output" in state["final_output"]
+    assert "did not meet the step's success criterion: no amount in output" in state["final_output"]

@@ -7,6 +7,8 @@ The LLM decides which tool to call at every step; nothing here is task-specific.
 import asyncio
 import json
 import os
+import re
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Any
 
@@ -164,7 +166,8 @@ Do not solve the task. Reply with JSON only, in this shape:
   "success_criteria": ["concrete, checkable conditions that prove the task was done correctly"]
 }
 Success criteria must be checkable by re-reading the outputs later, e.g. "output.csv has one data row per data row in amounts.csv",
-or "exactly one of approved.txt / rejected.txt exists and it states the reason"."""
+or "exactly one of approved.txt / rejected.txt exists and it states the reason".
+Do not demand more precision than the task asks for: money amounts rounded to 2 decimal places are correct."""
 
 
 async def understand_node(state: AgentState) -> dict[str, Any]:
@@ -340,6 +343,31 @@ async def choose_tool(user: str) -> dict[str, Any]:
     return {"tool": "invalid", "args": {}, "error": _clip(last_error, 500)}
 
 
+STEP_CHECK_SYSTEM = """\
+You check one step of an autonomous task worker. Given the step (with its success criterion) and the tool result,
+decide whether the result actually meets the criterion. Judge only what the result contains: a search result that
+does not contain the needed value, or code output that lacks what the step was supposed to produce, does not meet it.
+Do not check arithmetic.
+
+Reply with JSON only: {"met": true or false, "reason": "one short sentence"}"""
+
+STEP_CHECK_RESULT_LIMIT = 2000
+# read_file and write_file results are deterministic (contents / confirmation), so only these are judged.
+CHECKED_TOOLS = ("web_search", "run_python")
+
+
+async def _criterion_met(step: str, tool: str, result: str) -> tuple[bool, str]:
+    """Ask the LLM whether a successful tool result meets the plan step's own success criterion."""
+    user = f"Step: {step}\n\nTool called: {tool}\n\nResult:\n{_clip(result, STEP_CHECK_RESULT_LIMIT)}"
+    try:
+        check = await ask_json(STEP_CHECK_SYSTEM, user)
+    except RuntimeError:
+        return True, ""
+    if isinstance(check, dict) and check.get("met") is False:
+        return False, str(check.get("reason", "")).strip() or "result does not meet the step's success criterion"
+    return True, ""
+
+
 async def execute_node(state: AgentState) -> dict[str, Any]:
     """EXECUTE + OBSERVE + ADAPT: run one tool call for the current plan step and record what happened.
 
@@ -348,6 +376,10 @@ async def execute_node(state: AgentState) -> dict[str, Any]:
     unchanged so the graph loops back here and the LLM retries with a different
     approach; after MAX_ATTEMPTS_PER_STEP the step is recorded as failed and the
     agent moves on, leaving verify_node to judge the consequences.
+
+    A tool call that runs without error but does not meet the step's own success
+    criterion (e.g. a search that returns no usable value) also counts as a failed
+    attempt, recorded with status "unmet", so the fallback is visible in the trace.
     """
     index = state["current_step"]
     attempt = state.get("attempts", 0) + 1
@@ -363,21 +395,31 @@ async def execute_node(state: AgentState) -> dict[str, Any]:
     tool = str(decision.get("tool", ""))
     args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
 
+    note = ""
     if tool == "skip":
         result = f"Skipped: {decision.get('reason', 'no reason given')}"
-        ok = True
+        status = "ok"
     elif decision.get("error"):
         result = f"ERROR: model produced an unusable tool call: {decision['error']}"
-        ok = False
+        status = "error"
     else:
         result = await asyncio.to_thread(call_tool, tool, args)
-        ok = not is_error(result)
+        status = "error" if is_error(result) else "ok"
+        if status == "ok" and tool in CHECKED_TOOLS:
+            met, note = await _criterion_met(plan[index], tool, result)
+            if not met:
+                status = "unmet"
+    ok = status == "ok"
 
-    record = {"step": index + 1, "attempt": attempt, "tool": tool, "args": args, "result": result, "ok": ok}
+    record = {
+        "step": index + 1, "attempt": attempt, "tool": tool, "args": args,
+        "result": result, "ok": ok, "status": status, "note": note,
+    }
     shown_args = json.dumps(args, ensure_ascii=False)
+    label = {"ok": "Result", "error": "FAILED", "unmet": f"SUCCESS CRITERION NOT MET ({note}). Result was"}[status]
     observation = (
         f"Step {index + 1}, attempt {attempt}: {tool}({_clip(shown_args, 1500)})\n"
-        f"{'Result' if ok else 'FAILED'}: {_clip(result, OBSERVATION_CHAR_LIMIT)}"
+        f"{label}: {_clip(result, OBSERVATION_CHAR_LIMIT)}"
     )
 
     advance = ok or attempt >= MAX_ATTEMPTS_PER_STEP
@@ -484,10 +526,54 @@ async def verify_node(state: AgentState) -> dict[str, Any]:
 
 COMPLETE_SYSTEM = """\
 You are the "complete" stage of an autonomous task worker. Write the final report line for the user.
-State what was done and the concrete result, using real numbers from the log (rates, row counts, amounts, file paths).
-If verification failed, say plainly what is wrong or missing. Do not claim anything the log does not show.
+State what was done and the result. Every number you write (rates, amounts, counts) must be copied character for
+character from the evidence or the execution log; never compute, round or restate a number yourself. Do not list
+per-row values: the evidence section shows the file itself. If verification failed, say plainly what is wrong or
+missing. Do not claim anything the log does not show.
 
 Reply with JSON only: {"summary": "2-3 sentences", "caveats": ["limits or assumptions the user should know, if any"]}"""
+
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# Small whole numbers (step numbers, counts of rows/files) are not treated as factual claims to ground.
+_UNGROUNDED_EXEMPT_MAX = 31
+
+
+def _numbers(text: str) -> dict[Decimal, str]:
+    """Every number in the text, normalised (commas and trailing zeros removed) -> as first written."""
+    found: dict[Decimal, str] = {}
+    for token in _NUMBER_RE.findall(text):
+        try:
+            value = Decimal(token.replace(",", "").rstrip(".")).normalize()
+        except InvalidOperation:
+            continue
+        found.setdefault(value, token.rstrip(",."))
+    return found
+
+
+def ungrounded_numbers(text: str, sources: str) -> list[str]:
+    """Numbers stated in LLM-written text that appear nowhere in the sources it was written from."""
+    known = _numbers(sources)
+    return [
+        written
+        for value, written in _numbers(text).items()
+        if value not in known and not (value == value.to_integral_value() and value <= _UNGROUNDED_EXEMPT_MAX)
+    ]
+
+
+def _grounding_sources(state: AgentState) -> str:
+    """Everything a report may legitimately quote numbers from: the task, real tool results, re-read evidence."""
+    results = "\n".join(str(s["result"]) for s in state.get("steps_taken", []))
+    return f"{state['task']}\n{results}\n{state.get('evidence', '')}"
+
+
+def _fallback_summary(state: AgentState) -> str:
+    """Summary built only from state, used when the LLM's summary cannot be grounded."""
+    steps = state.get("steps_taken", [])
+    wrote = [str(s["args"].get("path")) for s in steps if s["tool"] == "write_file" and s["ok"]]
+    files = list(dict.fromkeys(state.get("understanding", {}).get("output_files", []) + wrote))
+    outcome = "passed verification" if state.get("verified") else "did not pass verification"
+    target = f" Output files: {', '.join(files)}." if files else ""
+    return f"Ran {len(steps)} tool calls; the result {outcome}.{target} The exact values are in the evidence below."
 
 
 def _preview(evidence: str) -> str:
@@ -505,36 +591,73 @@ def _preview(evidence: str) -> str:
 async def complete_node(state: AgentState) -> dict[str, Any]:
     """COMPLETE: assemble the final answer: summary, steps taken, verification verdict, evidence and caveats.
 
-    Last step of the loop. The summary is written by the LLM from the log; the step
-    list, verdict and evidence preview are assembled from state so the report shows
-    what actually happened, including failed attempts and fallbacks.
+    Last step of the loop. The summary is written by the LLM, then checked: every
+    number in it must appear in the tool results or the re-read evidence. An
+    ungrounded summary is re-asked once and otherwise replaced by one built from
+    state, so the narration cannot contradict the files under a "verified" verdict.
+    The step list, verdict and evidence preview are assembled from state.
     """
     steps = state.get("steps_taken", [])
+    sources = _grounding_sources(state)
     user = (
         f"Task: {state['task']}\n\n"
         f"Execution log:\n{_history(state)}\n\n"
+        f"Evidence (re-read from disk):\n{state.get('evidence', '')}\n\n"
         f"Verification: {'PASSED' if state.get('verified') else 'FAILED'} - {state.get('verify_reason', '')}"
     )
-    report = await ask_json(COMPLETE_SYSTEM, user)
-    if not isinstance(report, dict):
-        report = {"summary": str(report), "caveats": []}
+    caveats: list[str] = []
+    summary = ""
+    prompt = user
+    for _ in range(2):
+        report = await ask_json(COMPLETE_SYSTEM, prompt)
+        if not isinstance(report, dict):
+            report = {"summary": str(report), "caveats": []}
+        summary = str(report.get("summary", ""))
+        invented = ungrounded_numbers(summary, sources)
+        if not invented:
+            break
+        prompt = (
+            f"{user}\n\nYour previous summary stated numbers that are not in the evidence or the log: "
+            f"{', '.join(invented)}. Rewrite it using only numbers copied exactly from the evidence, or no numbers."
+        )
+    else:
+        summary = _fallback_summary(state)
+        caveats.append(
+            f"The model's own summary was discarded because it stated numbers not found in the evidence ({', '.join(invented)})."
+        )
 
-    caveats = _as_list(report.get("caveats"))
+    # Caveats are LLM-written too: keep only those whose numbers are grounded.
+    caveats += [c for c in _as_list(report.get("caveats")) if not ungrounded_numbers(c, sources)]
     for failed in (s for s in steps if not s["ok"]):
-        first_line = (failed["result"].splitlines() or [""])[0]
-        caveats.append(f"Step {failed['step']} attempt {failed['attempt']} ({failed['tool']}) failed: {first_line}")
+        if failed.get("status") == "unmet":
+            caveats.append(
+                f"Step {failed['step']} attempt {failed['attempt']} ({failed['tool']}) ran but did not meet "
+                f"the step's success criterion: {failed.get('note', '')}"
+            )
+        else:
+            first_line = (failed["result"].splitlines() or [""])[0]
+            caveats.append(f"Step {failed['step']} attempt {failed['attempt']} ({failed['tool']}) failed: {first_line}")
 
+    labels = {"ok": "ok   ", "error": "FAIL ", "unmet": "UNMET"}
     step_lines = [
-        f"  {s['step']}. {'ok  ' if s['ok'] else 'FAIL'} {s['tool']}"
+        f"  {s['step']}. {labels[s.get('status', 'ok' if s['ok'] else 'error')]} {s['tool']}"
         + (f" (attempt {s['attempt']})" if s["attempt"] > 1 else "")
+        + (f" - {s['note']}" if s.get("note") else "")
         for s in steps
     ]
     verified = bool(state.get("verified"))
+    verify_reason = state.get("verify_reason", "")
+    unbacked = ungrounded_numbers(verify_reason, sources)
+    if unbacked:
+        verify_reason += (
+            f"\n(The verifier's wording quotes numbers not found in the evidence: {', '.join(unbacked)}. "
+            "Rely on the check script output and the files below.)"
+        )
     sections = [
         "TASK COMPLETE - VERIFIED" if verified else "TASK FINISHED - NOT VERIFIED",
-        f"Summary: {report.get('summary', '')}",
+        f"Summary: {summary}",
         "Steps taken:\n" + "\n".join(step_lines),
-        f"Verification: {'passed' if verified else 'failed'}. {state.get('verify_reason', '')}",
+        f"Verification: {'passed' if verified else 'failed'}. {verify_reason}",
         "Evidence (re-read from disk):\n" + _preview(state.get("evidence", "")),
     ]
     if caveats:

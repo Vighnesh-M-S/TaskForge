@@ -115,7 +115,7 @@ fetch("/api/info").then((r) => r.json()).then((info) => {
 
 function addTrace(node, text) {
   const li = el("li");
-  li.append(el("span", "stage", node), el("span", "text" + (/FAILED|verified=False/.test(text) ? " fail" : ""), text));
+  li.append(el("span", "stage", node), el("span", "text" + (/FAILED|CRITERION NOT MET|verified=False/.test(text) ? " fail" : ""), text));
   $("trace").append(li);
   li.scrollIntoView({ block: "nearest" });
 }
