@@ -7,6 +7,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import AsyncIterator
@@ -72,6 +73,19 @@ def _produced_files(workspace: Path) -> dict[str, str]:
     return files
 
 
+def _friendly_error(exc: Exception) -> str:
+    """Error text for the page. Model quota errors get a plain explanation instead of the raw API payload."""
+    text = str(exc)
+    if "rate_limit" in text or "Error code: 429" in text:
+        wait = re.search(r"try again in ([0-9hms.]*[hms])", text)
+        scope = "daily" if "per day" in text else "per-minute"
+        return (
+            f"The model's {scope} free-tier quota is used up, so this run stopped before it could be verified."
+            + (f" Try again in about {wait.group(1)}." if wait else " Try again later.")
+        )
+    return f"{type(exc).__name__}: {text[:500]}"
+
+
 def _sse(event: dict[str, Any]) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
@@ -93,7 +107,7 @@ async def _run(task: str, queue: asyncio.Queue[dict[str, Any] | None]) -> None:
             }
         )
     except Exception as exc:
-        await queue.put({"type": "error", "message": f"{type(exc).__name__}: {str(exc)[:500]}"})
+        await queue.put({"type": "error", "message": _friendly_error(exc)})
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
         await queue.put(None)

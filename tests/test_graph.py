@@ -181,8 +181,60 @@ def test_summary_that_stays_ungrounded_is_replaced_and_disclosed(tmp_path: Path,
     assert "discarded because it stated numbers not found in the evidence (80.02)" in state["final_output"]
 
 
-def test_step_that_misses_its_success_criterion_is_retried_and_shown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    state = scripted_run(monkeypatch, tmp_path, ["Done."], checks=[{"met": False, "reason": "no amount in output"}, {"met": True}])
-    assert [(s["attempt"], s["status"]) for s in state["steps_taken"]] == [(1, "unmet"), (2, "ok")]
-    assert "1. UNMET run_python - no amount in output" in state["final_output"]
-    assert "did not meet the step's success criterion: no amount in output" in state["final_output"]
+def test_code_output_that_reports_an_error_is_retried_without_asking_the_llm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out.txt"
+    scripted_llm(
+        monkeypatch,
+        [
+            {"tool": "run_python", "args": {"code": "print(\"Error: 'rates'\")"}},
+            {"tool": "run_python", "args": {"code": f"open({str(out)!r}, 'w').write('79.98'); print('79.98')"}},
+            {"tool": "skip", "reason": "already written at plan step 1"},
+        ],
+        verified=True,
+    )
+    base = nodes.ask_json
+
+    async def ask(system: str, user: str) -> Any:
+        assert system is not nodes.STEP_CHECK_SYSTEM, "run_python results must not cost an LLM call to check"
+        return await base(system, user)
+
+    monkeypatch.setattr(nodes, "ask_json", ask)
+    state = run("convert it")
+
+    assert [(s["step"], s["attempt"], s["status"]) for s in state["steps_taken"]] == [(1, 1, "unmet"), (1, 2, "ok"), (2, 1, "ok")]
+    assert "1. UNMET run_python (plan called for read_file) - the output reports an error (Error: 'rates')" in state["final_output"]
+
+
+def test_search_result_checks() -> None:
+    import asyncio as aio
+
+    step = "[web_search] find the USD to EUR rate | success: snippet containing the numeric rate"
+    # No digit at all: rejected without an LLM call (ask_json is not patched here, so a call would raise).
+    assert aio.run(nodes._criterion_met(step, "web_search", "- Free, fast currency converter. Updated hourly.")) == (False, "the search result contains no number")
+    assert aio.run(nodes._criterion_met(step, "run_python", "(no output)"))[0] is False
+    # File tools are never checked.
+    assert aio.run(nodes._criterion_met(step, "read_file", "anything")) == (True, "")
+    # Code output that is not an error is accepted even if its format differs from the criterion's wording.
+    assert aio.run(nodes._criterion_met(step, "run_python", "Name,USD_Amount,EUR_Amount\nA,1,0.89")) == (True, "")
+
+
+def test_call_label_shows_target_source_and_deviation_from_plan() -> None:
+    fetch = {"tool": "run_python", "args": {"code": "import urllib.request\nurllib.request.urlopen('https://wttr.in/Bangalore?format=j1')"}, "planned_tool": "web_search"}
+    assert nodes.call_label(fetch) == "run_python [fetches wttr.in] (plan called for web_search)"
+    assert nodes.call_label({"tool": "write_file", "args": {"path": "demo/weather.txt", "content": "x"}, "planned_tool": "run_python"}) == "write_file demo/weather.txt (plan called for run_python)"
+    assert nodes.call_label({"tool": "web_search", "args": {"query": "weather Bangalore"}, "planned_tool": "web_search"}) == 'web_search "weather Bangalore"'
+    assert nodes.call_label({"tool": "run_python", "args": {"code": "print(1)"}, "planned_tool": "run_python"}) == "run_python"
+
+
+def test_report_explains_a_step_done_with_a_different_tool_and_a_skip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    out = tmp_path / "out.csv"
+    # Plan is read_file then write_file; the agent writes at plan step 1 and skips plan step 2.
+    scripted_llm(
+        monkeypatch,
+        [{"tool": "write_file", "args": {"path": str(out), "content": "n\n2\n"}}, {"tool": "skip", "reason": "already written at plan step 1"}],
+        verified=True,
+    )
+    state = run("double it")
+
+    assert f"1. ok    write_file {out} (plan called for read_file)" in state["final_output"]
+    assert "2. ok    skip - already written at plan step 1" in state["final_output"]

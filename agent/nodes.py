@@ -206,7 +206,11 @@ Rules:
 - You do not know the contents of files or the results of lookups yet, so describe what each step must achieve
   instead of inventing values. The exact tool arguments are chosen later, once earlier results are known.
 - web_search often returns only snippets without an exact number. For live data (exchange rates, weather),
-  plan the lookup as one step and expect the executor to fall back to run_python calling a free no-key JSON API.
+  plan the lookup as ONE step and expect the executor to fall back to run_python calling a free no-key JSON API.
+- Never plan a conditional or fallback step ("if the search did not work, then ..."). A step that fails is retried
+  automatically with a different approach, so each piece of information needs exactly one step.
+- Do not split "compute" and "write" for a file the same code can produce: one run_python step may read the input,
+  compute, and write the output file.
 - Do not add a verification step; a separate stage re-reads the outputs.
 - Do not create intermediate files. Values pass between steps through each step's printed result.
 - The final step must produce the output the task asks for (e.g. actually write the output file).
@@ -263,7 +267,10 @@ Available tools:
 {TOOL_DESCRIPTIONS}
 
 Rules:
-- Use real values from the observations (file contents, fetched numbers). Never invent data.
+- First read the observations. If they already contain what the current step is meant to produce (for example the
+  rate was already fetched, or the output file was already written correctly), skip the step. Do not redo work.
+- Use real values from the observations (file contents, fetched numbers). Never invent data. A value that is already
+  in the observations must be copied into your code as a constant, not fetched again.
 - If an earlier attempt at this step failed or returned nothing usable, try a different approach, not the same call.
   If web_search did not give an exact value, use run_python with urllib to call a free no-key JSON API, for example
   https://open.er-api.com/v6/latest/USD for exchange rates or https://wttr.in/<city>?format=j1 for weather.
@@ -344,21 +351,39 @@ async def choose_tool(user: str) -> dict[str, Any]:
 
 
 STEP_CHECK_SYSTEM = """\
-You check one step of an autonomous task worker. Given the step (with its success criterion) and the tool result,
-decide whether the result actually meets the criterion. Judge only what the result contains: a search result that
-does not contain the needed value, or code output that lacks what the step was supposed to produce, does not meet it.
-Do not check arithmetic.
+You check one step of an autonomous task worker. Given the step (with its success criterion) and the search result,
+decide whether the result contains the information the step needs. Judge substance, not format: a result that holds
+the needed value in any form meets the criterion; a result that only describes where the value could be found
+(e.g. generic text about a converter or a forecast site, with no actual value) does not.
 
 Reply with JSON only: {"met": true or false, "reason": "one short sentence"}"""
 
 STEP_CHECK_RESULT_LIMIT = 2000
-# read_file and write_file results are deterministic (contents / confirmation), so only these are judged.
-CHECKED_TOOLS = ("web_search", "run_python")
+_NUMERIC_HINTS = ("rate", "numeric", "number", "temperature", "amount", "price")
+_ERROR_OUTPUT_RE = re.compile(r"^\s*(error|exception|traceback|failed)\b", re.IGNORECASE)
 
 
 async def _criterion_met(step: str, tool: str, result: str) -> tuple[bool, str]:
-    """Ask the LLM whether a successful tool result meets the plan step's own success criterion."""
-    user = f"Step: {step}\n\nTool called: {tool}\n\nResult:\n{_clip(result, STEP_CHECK_RESULT_LIMIT)}"
+    """Whether a tool result that ran without error actually meets the plan step's own success criterion.
+
+    Decided without the LLM where possible: code that prints nothing or reports an error is a miss,
+    and so is a search result with no digit in it when the step needs a number. Other
+    run_python output is accepted (verify_node checks the final result). Only search
+    results that might contain the value are judged by the LLM, since that is a semantic call.
+    """
+    if tool not in ("web_search", "run_python"):
+        return True, ""
+    first_line = (result.strip().splitlines() or [""])[0]
+    if _ERROR_OUTPUT_RE.match(first_line):
+        return False, f"the output reports an error ({first_line[:80]})"
+    if tool == "run_python":
+        if result.strip() == "(no output)":
+            return False, "the code printed nothing, so its result cannot be used or checked"
+        return True, ""
+    criterion = step.split("| success:", 1)[-1].lower()
+    if any(hint in criterion for hint in _NUMERIC_HINTS) and not re.search(r"\d", result):
+        return False, "the search result contains no number"
+    user = f"Step: {step}\n\nSearch result:\n{_clip(result, STEP_CHECK_RESULT_LIMIT)}"
     try:
         check = await ask_json(STEP_CHECK_SYSTEM, user)
     except RuntimeError:
@@ -366,6 +391,32 @@ async def _criterion_met(step: str, tool: str, result: str) -> tuple[bool, str]:
     if isinstance(check, dict) and check.get("met") is False:
         return False, str(check.get("reason", "")).strip() or "result does not meet the step's success criterion"
     return True, ""
+
+
+_PLANNED_TOOL_RE = re.compile(r"^\[(\w+)\]")
+_URL_HOST_RE = re.compile(r"https?://([A-Za-z0-9.-]+)")
+
+
+def call_label(step: dict[str, Any]) -> str:
+    """How a recorded tool call is shown in the trace and report: the tool, what it acted on, and any deviation from the plan.
+
+    Built only from the recorded call, e.g. `run_python [fetches wttr.in] (plan called for web_search)`.
+    """
+    tool, args = step["tool"], step.get("args", {})
+    if tool == "skip":
+        return "skip"
+    if tool == "web_search":
+        detail = f' "{str(args.get("query", ""))[:80]}"'
+    elif tool in ("read_file", "write_file"):
+        detail = f" {args.get('path', '')}"
+    elif tool == "run_python":
+        hosts = list(dict.fromkeys(_URL_HOST_RE.findall(str(args.get("code", "")))))
+        detail = f" [fetches {', '.join(hosts)}]" if hosts else ""
+    else:
+        detail = ""
+    planned = step.get("planned_tool", "")
+    adapted = f" (plan called for {planned})" if planned and planned != tool else ""
+    return f"{tool}{detail}{adapted}"
 
 
 async def execute_node(state: AgentState) -> dict[str, Any]:
@@ -405,15 +456,17 @@ async def execute_node(state: AgentState) -> dict[str, Any]:
     else:
         result = await asyncio.to_thread(call_tool, tool, args)
         status = "error" if is_error(result) else "ok"
-        if status == "ok" and tool in CHECKED_TOOLS:
+        if status == "ok":
             met, note = await _criterion_met(plan[index], tool, result)
             if not met:
                 status = "unmet"
     ok = status == "ok"
 
+    planned = _PLANNED_TOOL_RE.match(plan[index])
     record = {
         "step": index + 1, "attempt": attempt, "tool": tool, "args": args,
         "result": result, "ok": ok, "status": status, "note": note,
+        "planned_tool": planned.group(1) if planned else "",
     }
     shown_args = json.dumps(args, ensure_ascii=False)
     label = {"ok": "Result", "error": "FAILED", "unmet": f"SUCCESS CRITERION NOT MET ({note}). Result was"}[status]
@@ -640,9 +693,10 @@ async def complete_node(state: AgentState) -> dict[str, Any]:
 
     labels = {"ok": "ok   ", "error": "FAIL ", "unmet": "UNMET"}
     step_lines = [
-        f"  {s['step']}. {labels[s.get('status', 'ok' if s['ok'] else 'error')]} {s['tool']}"
+        f"  {s['step']}. {labels[s.get('status', 'ok' if s['ok'] else 'error')]} {call_label(s)}"
         + (f" (attempt {s['attempt']})" if s["attempt"] > 1 else "")
         + (f" - {s['note']}" if s.get("note") else "")
+        + (f" - {s['result'].removeprefix('Skipped: ')}" if s["tool"] == "skip" else "")
         for s in steps
     ]
     verified = bool(state.get("verified"))
@@ -656,7 +710,7 @@ async def complete_node(state: AgentState) -> dict[str, Any]:
     sections = [
         "TASK COMPLETE - VERIFIED" if verified else "TASK FINISHED - NOT VERIFIED",
         f"Summary: {summary}",
-        "Steps taken:\n" + "\n".join(step_lines),
+        "Steps taken (numbered by plan step):\n" + "\n".join(step_lines),
         f"Verification: {'passed' if verified else 'failed'}. {verify_reason}",
         "Evidence (re-read from disk):\n" + _preview(state.get("evidence", "")),
     ]

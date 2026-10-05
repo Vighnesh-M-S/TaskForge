@@ -105,3 +105,12 @@ def test_run_python_does_not_see_api_keys(monkeypatch: pytest.MonkeyPatch) -> No
     assert "TASKFORGE_PASSWORD" not in output
     assert "PATH" in output
     assert tools._child_env().get("PATH")
+
+
+def test_quota_errors_are_explained_in_plain_words() -> None:
+    from web.app import _friendly_error
+
+    raw = "Error code: 429 - {'error': {'message': 'Rate limit reached ... on tokens per day (TPD): Limit 200000, Used 197391. Please try again in 2m57.12s.', 'code': 'rate_limit_exceeded'}}"
+    message = _friendly_error(RuntimeError(raw))
+    assert message == "The model's daily free-tier quota is used up, so this run stopped before it could be verified. Try again in about 2m57.12s."
+    assert _friendly_error(ValueError("boom")) == "ValueError: boom"

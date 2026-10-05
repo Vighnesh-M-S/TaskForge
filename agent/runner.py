@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from agent.graph import build_graph
+from agent.nodes import call_label
 from agent.state import AgentState
 
 # Two passes (initial + one repair) of plan + up to 8 steps x 3 attempts + verify, with headroom.
@@ -25,8 +26,10 @@ def describe(node: str, update: dict[str, Any]) -> str:
         return "\n".join(["plan:"] + [f"    {i + 1}. {s}" for i, s in enumerate(update["plan"])])
     if node == "execute":
         step = update["steps_taken"][-1]
-        head = f"step {step['step']} attempt {step['attempt']}: {step['tool']}"
+        head = f"plan step {step['step']} attempt {step['attempt']}: {call_label(step)}"
         status = step.get("status", "ok" if step["ok"] else "error")
+        if step["tool"] == "skip":
+            return f"plan step {step['step']}: skipped - {step['result'].removeprefix('Skipped: ')}"
         if status == "unmet":
             return f"{head} -> CRITERION NOT MET: {step.get('note', '')} | got: {_brief(step['result'])}"
         return f"{head} -> {'ok' if status == 'ok' else 'FAILED'}: {_brief(step['result'])}"
